@@ -3,6 +3,7 @@ import gridfs
 import os
 import io
 import pandas as pd
+import joblib
 
 from pymongo import MongoClient
 from PIL import Image
@@ -12,7 +13,7 @@ from tensorflow.keras.preprocessing.image import ImageDataGenerator
 from dotenv import load_dotenv
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import accuracy_score, confusion_matrix
+from sklearn.metrics import accuracy_score, classification_report
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.losses import CategoricalCrossentropy
 from tensorflow.keras.metrics import Accuracy, Precision, Recall, AUC
@@ -29,7 +30,7 @@ def carregar_labels_do_csv(caminho_csv):
     labels_dict = {}
     for index, row in df.iterrows():
         image_id = row['id']
-        labels = row[1:-1].values.astype(int) 
+        labels = row[1:].values.astype(int)  # Ajuste aqui para incluir todas as colunas exceto a primeira
         labels_dict[image_id] = labels
     return labels_dict
 
@@ -38,6 +39,11 @@ def carregar_lista_imagens(caminho_txt):
         lista_imagens = file.read().splitlines()
     return lista_imagens
 
+def calcular_porcentagem(parte, total):
+    if total == 0:
+        return 0
+    return (parte / total) * 100
+
 def carregar_imagens_do_mongodb(db, fs, labels_dict, lista_imagens):
     imagens = []
     labels = []
@@ -45,39 +51,41 @@ def carregar_imagens_do_mongodb(db, fs, labels_dict, lista_imagens):
     query = {"filename": {"$in": list(lista_imagens)}}
     total_imagens = db.fs.files.count_documents(query)
     imagens_processadas = 0
+    imagens_falhas = 0
+    images =  fs.find(query)
 
-    for grid_out in fs.find(query):
-        imagens_processadas += 1
-        
-        im_bytes = grid_out.read()
-        im = Image.open(io.BytesIO(im_bytes))
-        im = im.convert('RGB')
-        im = im.resize((128, 128))
-        imagens.append(np.array(im))
-        image_name = grid_out.filename
+    for grid_out in images:
+        try:
 
-        if image_name in labels_dict:
-            labels.append(labels_dict[image_name])
-        else:
-            labels.append(np.zeros(20))
+            imagens_processadas += 1
+            
+            im_bytes = grid_out.read()
+            im = Image.open(io.BytesIO(im_bytes))
+            im = im.convert('RGB')
+            im = im.resize((128, 128))
+            imagens.append(np.array(im))
+            image_name = grid_out.filename
 
-        print(f'Imagens processadas: {imagens_processadas}, Imagens restantes: {total_imagens - imagens_processadas}')
+            if image_name in labels_dict:
+                labels.append(labels_dict[image_name])
+            else:
+                labels.append(np.zeros(20))
 
+            porcentagem = calcular_porcentagem(imagens_processadas, total_imagens)
+            print(f'{porcentagem:.2f}% - Imagens processadas: {imagens_processadas}, Imagens restantes: {total_imagens - imagens_processadas}, Imagens não processadas: {imagens_falhas}')
+        except:
+            imagens_falhas += 1
+            print(f'{porcentagem:.2f}% - Imagens processadas: {imagens_processadas}, Imagens restantes: {total_imagens - imagens_processadas}, Imagens não processadas: {imagens_falhas}')
+    
     return np.array(imagens), np.array(labels)
 
 def calcular_metricas(y_true, y_pred):
-    cm = confusion_matrix(y_true, y_pred)
-    tn, fp, fn, tp = cm.ravel()
+    report = classification_report(y_true, y_pred, output_dict=True)
     accuracy = accuracy_score(y_true, y_pred)
-    prevalence = (tp + fn) / (tp + fn + tn + fp)
-    sensitivity = tp / (tp + fn)
-    specificity = tn / (tn + fp)
     
     return {
         'accuracy': accuracy,
-        'prevalence': prevalence,
-        'sensitivity': sensitivity,
-        'specificity': specificity
+        'classification_report': report
     }
 
 def construir_modelo_cnn(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy']):
@@ -126,9 +134,19 @@ def treinar_modelo_cnn(modelo, imagens, labels):
     if imagens.size == 0 or labels.size == 0:
         raise ValueError("Imagens ou labels estão vazios. Verifique se os dados foram carregados corretamente.")
     
-    datagen = ImageDataGenerator(rescale=1.0/255.0)
+    datagen = ImageDataGenerator(
+        rescale=1.0/255.0,
+        rotation_range=40,
+        width_shift_range=0.2,
+        height_shift_range=0.2,
+        shear_range=0.2,
+        zoom_range=0.2,
+        horizontal_flip=True,
+        fill_mode='nearest'
+    )
+    
     train_generator = datagen.flow(imagens, labels, batch_size=32)
-    modelo.fit(train_generator, epochs=1000)
+    modelo.fit(train_generator, epochs=100)
     return modelo
 
 def processar_imagens(caminho_csv, caminho_txt):
@@ -138,11 +156,10 @@ def processar_imagens(caminho_csv, caminho_txt):
     lista_imagens = carregar_lista_imagens(caminho_txt)
     imagens, labels = carregar_imagens_do_mongodb(db, fs, labels_dict, lista_imagens)
 
-
     if imagens.size == 0 or labels.size == 0:
         raise ValueError("Nenhuma imagem ou label foi carregada. Verifique os caminhos e os dados fornecidos.")
     
-    optimizer = Adam(learning_rate=0.001)
+    optimizer = Adam(learning_rate=0.0001)
     loss = CategoricalCrossentropy()
     metrics = [Accuracy(), Precision(), Recall(), AUC()]
     modelo_cnn = construir_modelo_cnn(optimizer=optimizer, loss=loss, metrics=metrics)
@@ -166,6 +183,7 @@ if __name__ == '__main__':
 
     modelo_cnn_treinado, modelo_knn_treinado, modelo_rf_treinado = processar_imagens(caminho_csv, caminho_txt)
     
-    modelo_rf_treinado.save('modelo_rf_treinado.h5')
-    modelo_knn_treinado.save('modelo_knn_treinado.h5')
+    # Salvar modelos
     modelo_cnn_treinado.save('modelo_cnn_treinado.h5')
+    joblib.dump(modelo_knn_treinado, 'modelo_knn_treinado.pkl')
+    joblib.dump(modelo_rf_treinado, 'modelo_rf_treinado.pkl')
